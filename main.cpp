@@ -5,7 +5,6 @@
 #include <string>
 #include <filesystem>
 #include <sstream>
-#include <unordered_map>
 #include <set>
 
 namespace fs = std::filesystem;
@@ -26,9 +25,10 @@ public:
     }
 
     void insert(const std::string& index, int value) {
-        std::unordered_map<std::string, std::set<int>> allData;
+        std::set<int> values;
+        bool found = false;
 
-        // Read existing data
+        // Read existing values for this index only
         if (fs::exists(dataFile)) {
             std::ifstream inFile(dataFile);
             std::string line;
@@ -37,35 +37,60 @@ public:
                 std::istringstream iss(line);
                 std::string idx;
                 iss >> idx;
-                int val;
-                while (iss >> val) {
-                    allData[idx].insert(val);
+                if (idx == index) {
+                    found = true;
+                    int val;
+                    while (iss >> val) {
+                        values.insert(val);
+                    }
+                    break;
                 }
             }
             inFile.close();
         }
 
         // Add new value
-        allData[index].insert(value);
+        values.insert(value);
 
-        // Write all data back
-        std::ofstream outFile(dataFile);
-        for (const auto& [idx, values] : allData) {
-            outFile << idx;
-            for (int val : values) {
-                outFile << " " << val;
+        // Create temporary file with updated data
+        std::string tempFile = dataFile + ".tmp";
+        std::ofstream outFile(tempFile);
+
+        // Copy all data except the index we're updating
+        if (fs::exists(dataFile)) {
+            std::ifstream inFile(dataFile);
+            std::string line;
+            while (std::getline(inFile, line)) {
+                if (line.empty()) continue;
+                std::istringstream iss(line);
+                std::string idx;
+                iss >> idx;
+                if (idx != index) {
+                    outFile << line << "\n";
+                }
             }
-            outFile << "\n";
+            inFile.close();
         }
+
+        // Write the updated index
+        outFile << index;
+        for (int val : values) {
+            outFile << " " << val;
+        }
+        outFile << "\n";
         outFile.close();
+
+        // Replace original file
+        fs::rename(tempFile, dataFile);
     }
 
     void deleteEntry(const std::string& index, int value) {
         if (!fs::exists(dataFile)) return;
 
-        std::unordered_map<std::string, std::set<int>> allData;
+        std::string tempFile = dataFile + ".tmp";
+        std::ofstream outFile(tempFile);
+        bool found = false;
 
-        // Read existing data
         std::ifstream inFile(dataFile);
         std::string line;
         while (std::getline(inFile, line)) {
@@ -73,32 +98,30 @@ public:
             std::istringstream iss(line);
             std::string idx;
             iss >> idx;
-            int val;
-            while (iss >> val) {
-                allData[idx].insert(val);
+            if (idx == index) {
+                found = true;
+                std::set<int> values;
+                int val;
+                while (iss >> val) {
+                    if (val != value) {
+                        values.insert(val);
+                    }
+                }
+                if (!values.empty()) {
+                    outFile << index;
+                    for (int v : values) {
+                        outFile << " " << v;
+                    }
+                    outFile << "\n";
+                }
+            } else {
+                outFile << line << "\n";
             }
         }
         inFile.close();
-
-        // Remove value
-        auto it = allData.find(index);
-        if (it != allData.end()) {
-            it->second.erase(value);
-            if (it->second.empty()) {
-                allData.erase(it);
-            }
-        }
-
-        // Write back
-        std::ofstream outFile(dataFile);
-        for (const auto& [idx, values] : allData) {
-            outFile << idx;
-            for (int val : values) {
-                outFile << " " << val;
-            }
-            outFile << "\n";
-        }
         outFile.close();
+
+        fs::rename(tempFile, dataFile);
     }
 
     std::vector<int> find(const std::string& index) {
