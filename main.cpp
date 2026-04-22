@@ -5,17 +5,31 @@
 #include <string>
 #include <filesystem>
 #include <sstream>
-#include <set>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
 
 class FileStorage {
 private:
-    std::string dataFile = "data/storage.txt";
+    std::string dataDir = "data";
+    static const int NUM_BUCKETS = 20; // Limited number of files
+
+    int getBucketId(const std::string& index) {
+        // Simple hash function
+        unsigned int hash = 0;
+        for (char c : index) {
+            hash = hash * 31 + c;
+        }
+        return hash % NUM_BUCKETS;
+    }
+
+    std::string getBucketFilename(int bucketId) {
+        return dataDir + "/bucket_" + std::to_string(bucketId) + ".txt";
+    }
 
     void ensureDataDir() {
-        if (!fs::exists("data")) {
-            fs::create_directory("data");
+        if (!fs::exists(dataDir)) {
+            fs::create_directory(dataDir);
         }
     }
 
@@ -25,109 +39,99 @@ public:
     }
 
     void insert(const std::string& index, int value) {
-        std::set<int> values;
-        bool found = false;
+        int bucketId = getBucketId(index);
+        std::string bucketFile = getBucketFilename(bucketId);
 
-        // Read existing values for this index only
-        if (fs::exists(dataFile)) {
-            std::ifstream inFile(dataFile);
+        // Read all data from this bucket
+        std::unordered_map<std::string, std::vector<int>> bucketData;
+
+        if (fs::exists(bucketFile)) {
+            std::ifstream inFile(bucketFile);
             std::string line;
             while (std::getline(inFile, line)) {
                 if (line.empty()) continue;
                 std::istringstream iss(line);
                 std::string idx;
                 iss >> idx;
-                if (idx == index) {
-                    found = true;
-                    int val;
-                    while (iss >> val) {
-                        values.insert(val);
-                    }
-                    break;
+                int val;
+                while (iss >> val) {
+                    bucketData[idx].push_back(val);
                 }
             }
             inFile.close();
         }
 
-        // Add new value
-        values.insert(value);
+        // Add value and keep sorted
+        auto& values = bucketData[index];
+        auto it = std::lower_bound(values.begin(), values.end(), value);
+        if (it == values.end() || *it != value) {
+            values.insert(it, value);
+        }
 
-        // Create temporary file with updated data
-        std::string tempFile = dataFile + ".tmp";
-        std::ofstream outFile(tempFile);
-
-        // Copy all data except the index we're updating
-        if (fs::exists(dataFile)) {
-            std::ifstream inFile(dataFile);
-            std::string line;
-            while (std::getline(inFile, line)) {
-                if (line.empty()) continue;
-                std::istringstream iss(line);
-                std::string idx;
-                iss >> idx;
-                if (idx != index) {
-                    outFile << line << "\n";
-                }
+        // Write back to bucket file
+        std::ofstream outFile(bucketFile);
+        for (const auto& [idx, vals] : bucketData) {
+            outFile << idx;
+            for (int v : vals) {
+                outFile << " " << v;
             }
-            inFile.close();
+            outFile << "\n";
         }
-
-        // Write the updated index
-        outFile << index;
-        for (int val : values) {
-            outFile << " " << val;
-        }
-        outFile << "\n";
         outFile.close();
-
-        // Replace original file
-        fs::rename(tempFile, dataFile);
     }
 
     void deleteEntry(const std::string& index, int value) {
-        if (!fs::exists(dataFile)) return;
+        int bucketId = getBucketId(index);
+        std::string bucketFile = getBucketFilename(bucketId);
 
-        std::string tempFile = dataFile + ".tmp";
-        std::ofstream outFile(tempFile);
-        bool found = false;
+        if (!fs::exists(bucketFile)) return;
 
-        std::ifstream inFile(dataFile);
+        // Read all data from this bucket
+        std::unordered_map<std::string, std::vector<int>> bucketData;
+
+        std::ifstream inFile(bucketFile);
         std::string line;
         while (std::getline(inFile, line)) {
             if (line.empty()) continue;
             std::istringstream iss(line);
             std::string idx;
             iss >> idx;
-            if (idx == index) {
-                found = true;
-                std::set<int> values;
-                int val;
-                while (iss >> val) {
-                    if (val != value) {
-                        values.insert(val);
-                    }
+            int val;
+            while (iss >> val) {
+                if (idx == index && val == value) {
+                    // Skip this value
+                    continue;
                 }
-                if (!values.empty()) {
-                    outFile << index;
-                    for (int v : values) {
-                        outFile << " " << v;
-                    }
-                    outFile << "\n";
-                }
-            } else {
-                outFile << line << "\n";
+                bucketData[idx].push_back(val);
             }
         }
         inFile.close();
+
+        // Write back to bucket file
+        std::ofstream outFile(bucketFile);
+        for (const auto& [idx, vals] : bucketData) {
+            outFile << idx;
+            for (int v : vals) {
+                outFile << " " << v;
+            }
+            outFile << "\n";
+        }
         outFile.close();
 
-        fs::rename(tempFile, dataFile);
+        // Delete file if empty
+        if (bucketData.empty()) {
+            fs::remove(bucketFile);
+        }
     }
 
     std::vector<int> find(const std::string& index) {
-        if (!fs::exists(dataFile)) return {};
+        int bucketId = getBucketId(index);
+        std::string bucketFile = getBucketFilename(bucketId);
 
-        std::ifstream inFile(dataFile);
+        if (!fs::exists(bucketFile)) return {};
+
+        // Read bucket file and find the index
+        std::ifstream inFile(bucketFile);
         std::string line;
         while (std::getline(inFile, line)) {
             if (line.empty()) continue;
