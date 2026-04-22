@@ -6,74 +6,18 @@
 #include <filesystem>
 #include <sstream>
 #include <unordered_map>
-#include <cstring>
+#include <set>
 
 namespace fs = std::filesystem;
 
 class FileStorage {
 private:
-    std::string dataDir = "data";
-    std::string indexFile = dataDir + "/index.dat";
-    static const int BUCKET_SIZE = 100; // Group 100 indices per file
-
-    struct IndexEntry {
-        char index[65];
-        int fileId;
-        int offset;
-        int count;
-    };
-
-    int getFileId(const std::string& index) {
-        // Simple hash to distribute indices across buckets
-        unsigned int hash = 0;
-        for (char c : index) {
-            hash = hash * 31 + c;
-        }
-        return hash % BUCKET_SIZE;
-    }
-
-    std::string getBucketFilename(int fileId) {
-        return dataDir + "/bucket_" + std::to_string(fileId) + ".dat";
-    }
+    std::string dataFile = "data/storage.txt";
 
     void ensureDataDir() {
-        if (!fs::exists(dataDir)) {
-            fs::create_directory(dataDir);
+        if (!fs::exists("data")) {
+            fs::create_directory("data");
         }
-    }
-
-    std::vector<int> readValuesFromOffset(const std::string& filename, int offset, int count) {
-        std::vector<int> values;
-        if (!fs::exists(filename) || count == 0) return values;
-
-        std::ifstream inFile(filename, std::ios::binary);
-        if (!inFile) return values;
-
-        inFile.seekg(offset);
-        for (int i = 0; i < count; i++) {
-            int val;
-            inFile.read(reinterpret_cast<char*>(&val), sizeof(int));
-            values.push_back(val);
-        }
-        inFile.close();
-
-        return values;
-    }
-
-    void writeValuesAtOffset(const std::string& filename, int offset, const std::vector<int>& values) {
-        std::fstream file(filename, std::ios::in | std::ios::out | std::ios::binary);
-        if (!file) {
-            // Create file if it doesn't exist
-            std::ofstream createFile(filename, std::ios::binary);
-            createFile.close();
-            file.open(filename, std::ios::in | std::ios::out | std::ios::binary);
-        }
-
-        file.seekp(offset);
-        for (int val : values) {
-            file.write(reinterpret_cast<const char*>(&val), sizeof(int));
-        }
-        file.close();
     }
 
 public:
@@ -82,146 +26,99 @@ public:
     }
 
     void insert(const std::string& index, int value) {
-        int fileId = getFileId(index);
-        std::string bucketFile = getBucketFilename(fileId);
+        std::unordered_map<std::string, std::set<int>> allData;
 
-        // Read all data from bucket file
-        std::unordered_map<std::string, std::vector<int>> bucketData;
-
-        if (fs::exists(bucketFile)) {
-            std::ifstream inFile(bucketFile, std::ios::binary);
-            int numIndices;
-            inFile.read(reinterpret_cast<char*>(&numIndices), sizeof(int));
-
-            for (int i = 0; i < numIndices; i++) {
-                IndexEntry entry;
-                inFile.read(reinterpret_cast<char*>(&entry), sizeof(IndexEntry));
-
-                std::vector<int> values = readValuesFromOffset(bucketFile, entry.offset, entry.count);
-                bucketData[entry.index] = values;
+        // Read existing data
+        if (fs::exists(dataFile)) {
+            std::ifstream inFile(dataFile);
+            std::string line;
+            while (std::getline(inFile, line)) {
+                if (line.empty()) continue;
+                std::istringstream iss(line);
+                std::string idx;
+                iss >> idx;
+                int val;
+                while (iss >> val) {
+                    allData[idx].insert(val);
+                }
             }
             inFile.close();
         }
 
-        // Add value to the index
-        auto& values = bucketData[index];
-        auto it = std::lower_bound(values.begin(), values.end(), value);
-        if (it == values.end() || *it != value) {
-            values.insert(it, value);
-        }
+        // Add new value
+        allData[index].insert(value);
 
-        // Write back to bucket file
-        std::ofstream outFile(bucketFile, std::ios::binary);
-        int numIndices = bucketData.size();
-        outFile.write(reinterpret_cast<const char*>(&numIndices), sizeof(int));
-
-        int currentOffset = sizeof(int) + numIndices * sizeof(IndexEntry);
-        for (auto& [idx, vals] : bucketData) {
-            IndexEntry entry;
-            std::strncpy(entry.index, idx.c_str(), 64);
-            entry.index[64] = '\0';
-            entry.fileId = fileId;
-            entry.offset = currentOffset;
-            entry.count = vals.size();
-
-            outFile.write(reinterpret_cast<const char*>(&entry), sizeof(IndexEntry));
-            currentOffset += vals.size() * sizeof(int);
-        }
-
-        // Write values after all index entries
-        for (auto& [idx, vals] : bucketData) {
-            for (int val : vals) {
-                outFile.write(reinterpret_cast<const char*>(&val), sizeof(int));
+        // Write all data back
+        std::ofstream outFile(dataFile);
+        for (const auto& [idx, values] : allData) {
+            outFile << idx;
+            for (int val : values) {
+                outFile << " " << val;
             }
+            outFile << "\n";
         }
-
         outFile.close();
     }
 
     void deleteEntry(const std::string& index, int value) {
-        int fileId = getFileId(index);
-        std::string bucketFile = getBucketFilename(fileId);
+        if (!fs::exists(dataFile)) return;
 
-        if (!fs::exists(bucketFile)) return;
+        std::unordered_map<std::string, std::set<int>> allData;
 
-        // Read all data from bucket file
-        std::unordered_map<std::string, std::vector<int>> bucketData;
-
-        std::ifstream inFile(bucketFile, std::ios::binary);
-        int numIndices;
-        inFile.read(reinterpret_cast<char*>(&numIndices), sizeof(int));
-
-        for (int i = 0; i < numIndices; i++) {
-            IndexEntry entry;
-            inFile.read(reinterpret_cast<char*>(&entry), sizeof(IndexEntry));
-
-            std::vector<int> values = readValuesFromOffset(bucketFile, entry.offset, entry.count);
-            bucketData[entry.index] = values;
+        // Read existing data
+        std::ifstream inFile(dataFile);
+        std::string line;
+        while (std::getline(inFile, line)) {
+            if (line.empty()) continue;
+            std::istringstream iss(line);
+            std::string idx;
+            iss >> idx;
+            int val;
+            while (iss >> val) {
+                allData[idx].insert(val);
+            }
         }
         inFile.close();
 
-        // Remove value from index
-        auto it = bucketData.find(index);
-        if (it != bucketData.end()) {
-            auto& values = it->second;
-            auto vit = std::lower_bound(values.begin(), values.end(), value);
-            if (vit != values.end() && *vit == value) {
-                values.erase(vit);
-            }
-            if (values.empty()) {
-                bucketData.erase(it);
+        // Remove value
+        auto it = allData.find(index);
+        if (it != allData.end()) {
+            it->second.erase(value);
+            if (it->second.empty()) {
+                allData.erase(it);
             }
         }
 
-        // Write back to bucket file
-        std::ofstream outFile(bucketFile, std::ios::binary);
-        int newNumIndices = bucketData.size();
-        outFile.write(reinterpret_cast<const char*>(&newNumIndices), sizeof(int));
-
-        int currentOffset = sizeof(int) + newNumIndices * sizeof(IndexEntry);
-        for (auto& [idx, vals] : bucketData) {
-            IndexEntry entry;
-            std::strncpy(entry.index, idx.c_str(), 64);
-            entry.index[64] = '\0';
-            entry.fileId = fileId;
-            entry.offset = currentOffset;
-            entry.count = vals.size();
-
-            outFile.write(reinterpret_cast<const char*>(&entry), sizeof(IndexEntry));
-            currentOffset += vals.size() * sizeof(int);
-        }
-
-        // Write values after all index entries
-        for (auto& [idx, vals] : bucketData) {
-            for (int val : vals) {
-                outFile.write(reinterpret_cast<const char*>(&val), sizeof(int));
+        // Write back
+        std::ofstream outFile(dataFile);
+        for (const auto& [idx, values] : allData) {
+            outFile << idx;
+            for (int val : values) {
+                outFile << " " << val;
             }
+            outFile << "\n";
         }
-
         outFile.close();
-
-        if (bucketData.empty()) {
-            fs::remove(bucketFile);
-        }
     }
 
     std::vector<int> find(const std::string& index) {
-        int fileId = getFileId(index);
-        std::string bucketFile = getBucketFilename(fileId);
+        if (!fs::exists(dataFile)) return {};
 
-        if (!fs::exists(bucketFile)) return {};
-
-        std::ifstream inFile(bucketFile, std::ios::binary);
-        int numIndices;
-        inFile.read(reinterpret_cast<char*>(&numIndices), sizeof(int));
-
-        for (int i = 0; i < numIndices; i++) {
-            IndexEntry entry;
-            inFile.read(reinterpret_cast<char*>(&entry), sizeof(IndexEntry));
-
-            if (std::strcmp(entry.index, index.c_str()) == 0) {
+        std::ifstream inFile(dataFile);
+        std::string line;
+        while (std::getline(inFile, line)) {
+            if (line.empty()) continue;
+            std::istringstream iss(line);
+            std::string idx;
+            iss >> idx;
+            if (idx == index) {
+                std::vector<int> values;
+                int val;
+                while (iss >> val) {
+                    values.push_back(val);
+                }
                 inFile.close();
-                return readValuesFromOffset(bucketFile, entry.offset, entry.count);
+                return values;
             }
         }
 
