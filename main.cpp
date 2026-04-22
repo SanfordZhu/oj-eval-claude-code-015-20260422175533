@@ -6,16 +6,17 @@
 #include <filesystem>
 #include <sstream>
 #include <unordered_map>
+#include <set>
 
 namespace fs = std::filesystem;
 
 class FileStorage {
 private:
     std::string dataDir = "data";
-    static const int NUM_BUCKETS = 20; // Limited number of files
+    static const int NUM_BUCKETS = 20;
+    static const int COMPACT_THRESHOLD = 100; // Compact after 100 operations per bucket
 
     int getBucketId(const std::string& index) {
-        // Simple hash function
         unsigned int hash = 0;
         for (char c : index) {
             hash = hash * 31 + c;
@@ -27,23 +28,24 @@ private:
         return dataDir + "/bucket_" + std::to_string(bucketId) + ".txt";
     }
 
+    std::string getOperationsFilename(int bucketId) {
+        return dataDir + "/ops_" + std::to_string(bucketId) + ".txt";
+    }
+
     void ensureDataDir() {
         if (!fs::exists(dataDir)) {
             fs::create_directory(dataDir);
         }
     }
 
-public:
-    FileStorage() {
-        ensureDataDir();
-    }
-
-    void insert(const std::string& index, int value) {
-        int bucketId = getBucketId(index);
+    void compactBucket(int bucketId) {
         std::string bucketFile = getBucketFilename(bucketId);
+        std::string opsFile = getOperationsFilename(bucketId);
 
-        // Read all data from this bucket
-        std::unordered_map<std::string, std::vector<int>> bucketData;
+        if (!fs::exists(opsFile)) return;
+
+        // Read current state
+        std::unordered_map<std::string, std::set<int>> data;
 
         if (fs::exists(bucketFile)) {
             std::ifstream inFile(bucketFile);
@@ -55,101 +57,144 @@ public:
                 iss >> idx;
                 int val;
                 while (iss >> val) {
-                    bucketData[idx].push_back(val);
+                    data[idx].insert(val);
                 }
             }
             inFile.close();
         }
 
-        // Add value and keep sorted
-        auto& values = bucketData[index];
-        auto it = std::lower_bound(values.begin(), values.end(), value);
-        if (it == values.end() || *it != value) {
-            values.insert(it, value);
+        // Apply operations
+        std::ifstream opsIn(opsFile);
+        std::string op;
+        while (opsIn >> op) {
+            if (op == "I") {
+                std::string idx;
+                int val;
+                opsIn >> idx >> val;
+                data[idx].insert(val);
+            } else if (op == "D") {
+                std::string idx;
+                int val;
+                opsIn >> idx >> val;
+                data[idx].erase(val);
+                if (data[idx].empty()) {
+                    data.erase(idx);
+                }
+            }
         }
+        opsIn.close();
 
-        // Write back to bucket file
+        // Write compacted data
         std::ofstream outFile(bucketFile);
-        for (const auto& [idx, vals] : bucketData) {
+        for (const auto& [idx, values] : data) {
             outFile << idx;
-            for (int v : vals) {
+            for (int v : values) {
                 outFile << " " << v;
             }
             outFile << "\n";
         }
         outFile.close();
+
+        // Clear operations file
+        fs::remove(opsFile);
+    }
+
+public:
+    FileStorage() {
+        ensureDataDir();
+    }
+
+    void insert(const std::string& index, int value) {
+        int bucketId = getBucketId(index);
+        std::string opsFile = getOperationsFilename(bucketId);
+        std::string bucketFile = getBucketFilename(bucketId);
+
+        // Append operation to ops file
+        std::ofstream opsOut(opsFile, std::ios::app);
+        opsOut << "I " << index << " " << value << "\n";
+        opsOut.close();
+
+        // Check if we need to compact
+        static std::unordered_map<int, int> opCount;
+        opCount[bucketId]++;
+        if (opCount[bucketId] >= COMPACT_THRESHOLD) {
+            compactBucket(bucketId);
+            opCount[bucketId] = 0;
+        }
     }
 
     void deleteEntry(const std::string& index, int value) {
         int bucketId = getBucketId(index);
+        std::string opsFile = getOperationsFilename(bucketId);
         std::string bucketFile = getBucketFilename(bucketId);
 
-        if (!fs::exists(bucketFile)) return;
+        // Append operation to ops file
+        std::ofstream opsOut(opsFile, std::ios::app);
+        opsOut << "D " << index << " " << value << "\n";
+        opsOut.close();
 
-        // Read all data from this bucket
-        std::unordered_map<std::string, std::vector<int>> bucketData;
-
-        std::ifstream inFile(bucketFile);
-        std::string line;
-        while (std::getline(inFile, line)) {
-            if (line.empty()) continue;
-            std::istringstream iss(line);
-            std::string idx;
-            iss >> idx;
-            int val;
-            while (iss >> val) {
-                if (idx == index && val == value) {
-                    // Skip this value
-                    continue;
-                }
-                bucketData[idx].push_back(val);
-            }
-        }
-        inFile.close();
-
-        // Write back to bucket file
-        std::ofstream outFile(bucketFile);
-        for (const auto& [idx, vals] : bucketData) {
-            outFile << idx;
-            for (int v : vals) {
-                outFile << " " << v;
-            }
-            outFile << "\n";
-        }
-        outFile.close();
-
-        // Delete file if empty
-        if (bucketData.empty()) {
-            fs::remove(bucketFile);
+        // Also check for compaction
+        static std::unordered_map<int, int> opCount;
+        opCount[bucketId]++;
+        if (opCount[bucketId] >= COMPACT_THRESHOLD) {
+            compactBucket(bucketId);
+            opCount[bucketId] = 0;
         }
     }
 
     std::vector<int> find(const std::string& index) {
         int bucketId = getBucketId(index);
         std::string bucketFile = getBucketFilename(bucketId);
+        std::string opsFile = getOperationsFilename(bucketId);
 
-        if (!fs::exists(bucketFile)) return {};
+        // Build current state
+        std::unordered_map<std::string, std::set<int>> currentData;
 
-        // Read bucket file and find the index
-        std::ifstream inFile(bucketFile);
-        std::string line;
-        while (std::getline(inFile, line)) {
-            if (line.empty()) continue;
-            std::istringstream iss(line);
-            std::string idx;
-            iss >> idx;
-            if (idx == index) {
-                std::vector<int> values;
+        // Read base data
+        if (fs::exists(bucketFile)) {
+            std::ifstream inFile(bucketFile);
+            std::string line;
+            while (std::getline(inFile, line)) {
+                if (line.empty()) continue;
+                std::istringstream iss(line);
+                std::string idx;
+                iss >> idx;
                 int val;
                 while (iss >> val) {
-                    values.push_back(val);
+                    currentData[idx].insert(val);
                 }
-                inFile.close();
-                return values;
             }
+            inFile.close();
         }
 
-        inFile.close();
+        // Apply recent operations
+        if (fs::exists(opsFile)) {
+            std::ifstream opsIn(opsFile);
+            std::string op;
+            while (opsIn >> op) {
+                if (op == "I") {
+                    std::string idx;
+                    int val;
+                    opsIn >> idx >> val;
+                    currentData[idx].insert(val);
+                } else if (op == "D") {
+                    std::string idx;
+                    int val;
+                    opsIn >> idx >> val;
+                    currentData[idx].erase(val);
+                    if (currentData[idx].empty()) {
+                        currentData.erase(idx);
+                    }
+                }
+            }
+            opsIn.close();
+        }
+
+        // Return result
+        auto it = currentData.find(index);
+        if (it != currentData.end()) {
+            return std::vector<int>(it->second.begin(), it->second.end());
+        }
         return {};
     }
 };
